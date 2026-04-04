@@ -6,6 +6,7 @@ Interactive desktop viewer for DESI QSO cutouts, spectra, and spectral line over
 
 - **Browse QSO catalog** with keyboard shortcuts and combo box navigation
 - **View cutout images and spectra** side-by-side with synchronized zoom
+- **Open Legacy Survey from cutout** by clicking the displayed image (uses QSO RA/DEC)
 - **Overlay spectral lines** (emission and absorption) with redshift adjustment
 - **Toggle line categories** (emission, absorption, major-only) dynamically
 - **Persistent per-object notes** auto-saved to CSV
@@ -109,6 +110,7 @@ main()
 - **Previous/Next buttons**: Navigate catalog
 - **Emission/Absorption/Major Only buttons**: Toggle line overlays
 - **Reset View button**: Return plots to initial view range
+- **Help hint**: "Press F1 for help" reminder is shown in the top bar
 
 #### Redshift Controls
 
@@ -124,6 +126,12 @@ main()
 - **Ctrl+Scroll**: Zoom Y-axis (flux)
 - **Click/Drag**: Pan across spectrum
 
+#### Cutout Panel (Left)
+
+- **Clickable cutout image**: Opens Legacy Survey viewer in browser for the current object
+- **URL format used**: `https://www.legacysurvey.org/viewer?ra=<RA>&dec=<DEC>&layer=ls-dr10&zoom=16`
+- **Coordinates source**: `RA` and `DEC` columns from `data/tables/desi_qsos.csv`
+
 #### Info & Notes (Bottom)
 
 - **Info box (left)**: Displays catalog metadata for current QSO
@@ -133,7 +141,7 @@ main()
 
 1. **Launch**: `gotoq-qso-viewer`
 2. **Browse**: Use Left/Right Arrow keys or combo box to find QSO
-3. **Inspect**: View cutout and spectrum side-by-side
+3. **Inspect**: View cutout and spectrum side-by-side; click the cutout to open Legacy Survey
 4. **Adjust redshift**: Fine-tune with Alt+Left/Right keyboard or slider
 5. **Overlay lines**: Toggle `e`/`a`/`m` to show/hide spectral features
 6. **Add notes**: Press `c` to focus notes, type observations, press `Esc` to save
