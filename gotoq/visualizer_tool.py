@@ -257,6 +257,31 @@ class QSODataStore:
 		except (TypeError, ValueError):
 			return None
 
+	def _row_float(self, row: Dict[str, str], candidate_keys: List[str]) -> Optional[float]:
+		"""Return first parseable float from a row using candidate column names."""
+		for key in candidate_keys:
+			value = row.get(key, "")
+			try:
+				return float(value)
+			except (TypeError, ValueError):
+				continue
+		return None
+
+	def get_coordinates(self, desi_id: str) -> Optional[Tuple[float, float]]:
+		"""Retrieve (RA, DEC) coordinates for a QSO from catalog row.
+
+		Supports common column variants used across tables.
+		"""
+		row = self.get_row(desi_id)
+		if not row:
+			return None
+
+		ra = self._row_float(row, ["RA", "ra", "target_ra", "TARGET_RA"])
+		dec = self._row_float(row, ["DEC", "dec", "target_dec", "TARGET_DEC"])
+		if ra is None or dec is None:
+			return None
+		return (ra, dec)
+
 	def get_cutout_path(self, desi_id: str) -> Optional[Path]:
 		"""Look up JPEG cutout file path for a QSO.
 		
@@ -321,9 +346,11 @@ class ImageLabel(QtWidgets.QLabel):
 		"""Initialize image label with default styling."""
 		super().__init__()
 		self._source_pixmap: Optional[QtGui.QPixmap] = None
+		self._click_url: Optional[QtCore.QUrl] = None
 		self.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
 		self.setMinimumWidth(360)
 		self.setStyleSheet("border: 1px solid #C7C7C7; background: #F9F9F9;")
+		self.setCursor(QtCore.Qt.CursorShape.ArrowCursor)
 
 	def set_source_pixmap(self, pixmap: Optional[QtGui.QPixmap]) -> None:
 		"""Set or update the source image.
@@ -333,6 +360,29 @@ class ImageLabel(QtWidgets.QLabel):
 		"""
 		self._source_pixmap = pixmap
 		self._refresh()
+
+	def set_click_url(self, url: Optional[str]) -> None:
+		"""Set URL to open when image is clicked; pass None to disable."""
+		if url:
+			self._click_url = QtCore.QUrl(url)
+			self.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+			self.setToolTip("Open in Legacy Survey viewer")
+		else:
+			self._click_url = None
+			self.setCursor(QtCore.Qt.CursorShape.ArrowCursor)
+			self.setToolTip("")
+
+	def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
+		"""Open configured URL when left-clicking on the cutout image."""
+		if (
+			event.button() == QtCore.Qt.MouseButton.LeftButton
+			and self._click_url is not None
+			and self._click_url.isValid()
+		):
+			QtGui.QDesktopServices.openUrl(self._click_url)
+			event.accept()
+			return
+		super().mousePressEvent(event)
 
 	def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
 		"""Recompute scaled image on widget resize."""
@@ -454,6 +504,8 @@ class QSOViewer(QtWidgets.QMainWindow):
 		self._overlay_update_timer.setInterval(16)
 		self._overlay_update_timer.timeout.connect(self._apply_redshift_overlay_update)
 		self._shortcuts: List[QtGui.QShortcut] = []
+		self._legacy_survey_layer = "ls-dr10"
+		self._legacy_survey_zoom = 16
 
 		self._build_ui()
 		self._connect_signals()
@@ -491,6 +543,8 @@ class QSOViewer(QtWidgets.QMainWindow):
 		self.show_major_only_button.setCheckable(True)
 		self.show_major_only_button.setChecked(False)
 		self.reset_view_button = QtWidgets.QPushButton("Reset View")
+		self.help_hint_label = QtWidgets.QLabel("Press F1 for help")
+		self.help_hint_label.setStyleSheet("color: #666666; font-style: italic;")
 
 		control_layout.addWidget(QtWidgets.QLabel("DESI_ID:"))
 		control_layout.addWidget(self.id_combo)
@@ -500,6 +554,7 @@ class QSOViewer(QtWidgets.QMainWindow):
 		control_layout.addWidget(self.show_absorption_button)
 		control_layout.addWidget(self.show_major_only_button)
 		control_layout.addWidget(self.reset_view_button)
+		control_layout.addWidget(self.help_hint_label)
 		control_layout.addStretch(1)
 		root_layout.addLayout(control_layout)
 
@@ -995,6 +1050,7 @@ class QSOViewer(QtWidgets.QMainWindow):
 		Args:
 			desi_id: DESI identifier.
 		"""
+		self.image_label.set_click_url(self._legacy_survey_url_for(desi_id))
 		cutout_path = self.store.get_cutout_path(desi_id)
 		if cutout_path is None:
 			self.image_label.set_source_pixmap(None)
@@ -1003,6 +1059,18 @@ class QSOViewer(QtWidgets.QMainWindow):
 
 		pixmap = QtGui.QPixmap(str(cutout_path))
 		self.image_label.set_source_pixmap(pixmap)
+
+	def _legacy_survey_url_for(self, desi_id: str) -> Optional[str]:
+		"""Build Legacy Survey viewer URL for this QSO using catalog RA/DEC."""
+		coords = self.store.get_coordinates(desi_id)
+		if coords is None:
+			return None
+		ra, dec = coords
+		return (
+			"https://www.legacysurvey.org/viewer"
+			f"?ra={ra:.6f}&dec={dec:.6f}"
+			f"&layer={self._legacy_survey_layer}&zoom={self._legacy_survey_zoom}"
+		)
 
 	def _render_metadata(self, desi_id: str) -> None:
 		"""Display catalog rows as key:value pairs in info box.
