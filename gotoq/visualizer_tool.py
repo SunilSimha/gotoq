@@ -426,6 +426,105 @@ class CustomViewBox(pg.ViewBox):
 		ev.accept()
 
 
+class MatchHighlightDelegate(QtWidgets.QStyledItemDelegate):
+	"""Item delegate that highlights matched query text in completion popup rows."""
+
+	def __init__(self, query_getter, parent: Optional[QtCore.QObject] = None):
+		"""Initialize delegate.
+
+		Args:
+			query_getter: Callable returning current filter text.
+			parent: Optional Qt parent object.
+		"""
+		super().__init__(parent)
+		self._query_getter = query_getter
+
+	def paint(
+		self,
+		painter: QtGui.QPainter,
+		option: QtWidgets.QStyleOptionViewItem,
+		index: QtCore.QModelIndex,
+	) -> None:
+		"""Paint row text with highlighted matching substring."""
+		opt = QtWidgets.QStyleOptionViewItem(option)
+		self.initStyleOption(opt, index)
+		text = opt.text
+		opt.text = ""
+
+		style = opt.widget.style() if opt.widget is not None else QtWidgets.QApplication.style()
+		style.drawControl(QtWidgets.QStyle.ControlElement.CE_ItemViewItem, opt, painter, opt.widget)
+
+		if not text:
+			return
+
+		query = str(self._query_getter() or "").strip().lower()
+		match_start = text.lower().find(query) if query else -1
+
+		text_rect = style.subElementRect(
+			QtWidgets.QStyle.SubElement.SE_ItemViewItemText,
+			opt,
+			opt.widget,
+		)
+		if not text_rect.isValid():
+			text_rect = opt.rect.adjusted(6, 0, -6, 0)
+
+		painter.save()
+		try:
+			is_selected = bool(opt.state & QtWidgets.QStyle.StateFlag.State_Selected)
+			text_color_role = (
+				QtGui.QPalette.ColorRole.HighlightedText
+				if is_selected
+				else QtGui.QPalette.ColorRole.Text
+			)
+			text_color = opt.palette.color(text_color_role)
+			base_font = opt.font
+			bold_font = QtGui.QFont(base_font)
+			bold_font.setBold(True)
+
+			fm_base = QtGui.QFontMetrics(base_font)
+			fm_bold = QtGui.QFontMetrics(bold_font)
+			baseline = text_rect.y() + (text_rect.height() + fm_base.ascent() - fm_base.descent()) // 2
+			x = text_rect.x()
+
+			if match_start < 0:
+				painter.setFont(base_font)
+				painter.setPen(text_color)
+				painter.drawText(
+					text_rect,
+					QtCore.Qt.AlignmentFlag.AlignVCenter | QtCore.Qt.AlignmentFlag.AlignLeft,
+					text,
+				)
+				return
+
+			match_end = match_start + len(query)
+			before = text[:match_start]
+			match = text[match_start:match_end]
+			after = text[match_end:]
+
+			if before:
+				painter.setFont(base_font)
+				painter.setPen(text_color)
+				painter.drawText(QtCore.QPoint(x, baseline), before)
+				x += fm_base.horizontalAdvance(before)
+
+			if match:
+				match_width = fm_bold.horizontalAdvance(match)
+				highlight = QtGui.QColor(255, 220, 80, 170 if is_selected else 125)
+				highlight_rect = QtCore.QRect(x, text_rect.y() + 2, match_width, max(text_rect.height() - 4, 1))
+				painter.fillRect(highlight_rect, highlight)
+				painter.setFont(bold_font)
+				painter.setPen(text_color)
+				painter.drawText(QtCore.QPoint(x, baseline), match)
+				x += match_width
+
+			if after:
+				painter.setFont(base_font)
+				painter.setPen(text_color)
+				painter.drawText(QtCore.QPoint(x, baseline), after)
+		finally:
+			painter.restore()
+
+
 class QSOViewer(QtWidgets.QMainWindow):
 	"""Main application window for QSO data exploration.
 
@@ -440,10 +539,12 @@ class QSOViewer(QtWidgets.QMainWindow):
 
 	Keyboard shortcuts:
 	  - Left/Right Arrow: Navigate catalog
+	  - [ / ]: Pan spectrum view left/right by 20% of current x-range
 	  - Alt+Left/Right: Large redshift steps (100x multiplier)
 	  - Shift+Alt+Left/Right: Very large redshift steps (1000x)
 	  - q: Quit
 	  - F1: Show help
+	  - v: Reset plot view ranges
 	  - z: Reset redshift
 	  - e/a/m: Toggle emission/absorption/major lines
 	  - c: Focus notes input
@@ -459,6 +560,9 @@ class QSOViewer(QtWidgets.QMainWindow):
 		self.store = store
 		self.current_index = 0
 		self.current_id: Optional[str] = None
+		self._id_to_index: Dict[str, int] = {}
+		self._visible_ids: List[str] = []
+		self._combo_updating = False
 
 		self._syncing_ranges = False
 		self._suspend_sync = False
@@ -495,6 +599,19 @@ class QSOViewer(QtWidgets.QMainWindow):
 		self.raw_error_item: Optional[pg.PlotDataItem] = None
 		self.clip_flux_item: Optional[pg.PlotDataItem] = None
 		self.clip_error_item: Optional[pg.PlotDataItem] = None
+		self._id_source_model = QtCore.QStringListModel(self)
+		self._id_filter_model = QtCore.QSortFilterProxyModel(self)
+		self._id_filter_model.setSourceModel(self._id_source_model)
+		self._id_filter_model.setFilterCaseSensitivity(QtCore.Qt.CaseSensitivity.CaseInsensitive)
+		self._id_filter_model.setFilterKeyColumn(0)
+		self._id_completer = QtWidgets.QCompleter(self._id_filter_model, self)
+		self._id_completer.setCaseSensitivity(QtCore.Qt.CaseSensitivity.CaseInsensitive)
+		self._id_completer.setFilterMode(QtCore.Qt.MatchFlag.MatchContains)
+		self._id_completer.setCompletionMode(QtWidgets.QCompleter.CompletionMode.PopupCompletion)
+		self._id_completer.setModelSorting(QtWidgets.QCompleter.ModelSorting.CaseInsensitivelySortedModel)
+		self._id_match_delegate = MatchHighlightDelegate(self._current_id_query_text, self)
+		self._mouse_move_proxies: List[pg.SignalProxy] = []
+		self._hover_labels: Dict[str, pg.TextItem] = {}
 
 		self.note_save_timer = QtCore.QTimer(self)
 		self.note_save_timer.setSingleShot(True)
@@ -516,14 +633,17 @@ class QSOViewer(QtWidgets.QMainWindow):
 		self.setWindowTitle("GOTOQ QSO Visualizer")
 		self.resize(1600, 980)
 
-		if self.store.ids:
-			self.set_current_object(self.store.ids[0])
+		if self._visible_ids:
+			self.set_current_object(self._visible_ids[0])
 		else:
 			self.statusBar().showMessage("No matching DESI objects found in data folders.")
 
 	def _build_ui(self) -> None:
 		"""Construct the complete widget hierarchy and layout."""
 		central = QtWidgets.QWidget()
+		# Allow central widget to receive focus so it can act as a reliable
+		# blur target when text inputs are dismissed (Esc / background click).
+		central.setFocusPolicy(QtCore.Qt.FocusPolicy.ClickFocus)
 		self.setCentralWidget(central)
 
 		root_layout = QtWidgets.QVBoxLayout(central)
@@ -532,7 +652,11 @@ class QSOViewer(QtWidgets.QMainWindow):
 		self.prev_button = QtWidgets.QPushButton("Previous")
 		self.next_button = QtWidgets.QPushButton("Next")
 		self.id_combo = QtWidgets.QComboBox()
+		self.id_combo.setEditable(True)
+		self.id_combo.setInsertPolicy(QtWidgets.QComboBox.InsertPolicy.NoInsert)
 		self.id_combo.setMinimumWidth(280)
+		self.id_combo.setCompleter(self._id_completer)
+		self._id_completer.popup().setItemDelegate(self._id_match_delegate)
 		self.show_emission_button = QtWidgets.QPushButton("Emission")
 		self.show_emission_button.setCheckable(True)
 		self.show_emission_button.setChecked(True)
@@ -542,6 +666,9 @@ class QSOViewer(QtWidgets.QMainWindow):
 		self.show_major_only_button = QtWidgets.QPushButton("Major Only")
 		self.show_major_only_button.setCheckable(True)
 		self.show_major_only_button.setChecked(False)
+		self.comment_filter_button = QtWidgets.QPushButton("Commented Only")
+		self.comment_filter_button.setCheckable(True)
+		self.comment_filter_button.setChecked(False)
 		self.reset_view_button = QtWidgets.QPushButton("Reset View")
 		self.help_hint_label = QtWidgets.QLabel("Press F1 for help")
 		self.help_hint_label.setStyleSheet("color: #666666; font-style: italic;")
@@ -553,6 +680,7 @@ class QSOViewer(QtWidgets.QMainWindow):
 		control_layout.addWidget(self.show_emission_button)
 		control_layout.addWidget(self.show_absorption_button)
 		control_layout.addWidget(self.show_major_only_button)
+		control_layout.addWidget(self.comment_filter_button)
 		control_layout.addWidget(self.reset_view_button)
 		control_layout.addWidget(self.help_hint_label)
 		control_layout.addStretch(1)
@@ -605,6 +733,7 @@ class QSOViewer(QtWidgets.QMainWindow):
 		self.clip_plot.enableAutoRange(x=False, y=False)
 		self._init_spectrum_items()
 		self._init_legends()
+		self._init_hover_coordinate_labels()
 
 		lower_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
 		right_layout.addWidget(lower_splitter, 1)
@@ -632,10 +761,16 @@ class QSOViewer(QtWidgets.QMainWindow):
 		"""Connect UI widget signals to their handler slots."""
 		self.prev_button.clicked.connect(self._go_previous)
 		self.next_button.clicked.connect(self._go_next)
-		self.id_combo.currentTextChanged.connect(self._on_combo_changed)
+		self.id_combo.textActivated.connect(self._on_combo_committed)
+		self._id_completer.activated[str].connect(self._on_combo_committed)
+		line_edit = self.id_combo.lineEdit()
+		if line_edit is not None:
+			line_edit.returnPressed.connect(self._on_combo_return_pressed)
+			line_edit.textEdited.connect(self._on_combo_edit_text_changed)
 		self.show_emission_button.toggled.connect(self._refresh_line_overlays)
 		self.show_absorption_button.toggled.connect(self._refresh_line_overlays)
 		self.show_major_only_button.toggled.connect(self._refresh_line_overlays)
+		self.comment_filter_button.toggled.connect(self._on_comment_filter_toggled)
 		self.reset_view_button.clicked.connect(self._reset_view)
 		self.z_fine_slider.valueChanged.connect(self._on_fine_redshift_changed)
 		self.z_value_edit.returnPressed.connect(self._on_redshift_text_submitted)
@@ -652,9 +787,12 @@ class QSOViewer(QtWidgets.QMainWindow):
 		All shortcuts check whether a text input is focused to avoid triggering while typing."""
 		self._add_shortcut(QtGui.QKeySequence(QtCore.Qt.Key.Key_Left), self._on_shortcut_previous)
 		self._add_shortcut(QtGui.QKeySequence(QtCore.Qt.Key.Key_Right), self._on_shortcut_next)
+		self._add_shortcut(QtGui.QKeySequence("["), self._on_shortcut_pan_left)
+		self._add_shortcut(QtGui.QKeySequence("]"), self._on_shortcut_pan_right)
 		self._add_shortcut(QtGui.QKeySequence("q"), self._on_shortcut_quit)
 		self._add_shortcut(QtGui.QKeySequence(QtCore.Qt.Key.Key_Escape), self._on_shortcut_clear_text_focus)
 		self._add_shortcut(QtGui.QKeySequence("F1"), self._on_shortcut_show_help)
+		self._add_shortcut(QtGui.QKeySequence("v"), self._on_shortcut_reset_view)
 		self._add_shortcut(QtGui.QKeySequence("z"), self._on_shortcut_reset_redshift)
 		self._add_shortcut(QtGui.QKeySequence("e"), self._on_shortcut_toggle_emission)
 		self._add_shortcut(QtGui.QKeySequence("a"), self._on_shortcut_toggle_absorption)
@@ -711,12 +849,45 @@ class QSOViewer(QtWidgets.QMainWindow):
 			True if notes editor or redshift text field has focus.
 		"""
 		focused = self.focusWidget()
+		combo_line_edit = self.id_combo.lineEdit()
+		completer = self.id_combo.completer()
+		combo_popup = None if completer is None else completer.popup()
+		if combo_popup is not None and combo_popup.isVisible():
+			return True
 		if focused is None:
 			return False
 		return (
 			self._widget_is_or_inside(focused, self.notes_editor)
 			or self._widget_is_or_inside(focused, self.z_value_edit)
+			or (
+				combo_line_edit is not None
+				and self._widget_is_or_inside(focused, combo_line_edit)
+			)
+			or (
+				combo_popup is not None
+				and self._widget_is_or_inside(focused, combo_popup)
+			)
 		)
+
+	def _current_id_query_text(self) -> str:
+		"""Return current Target ID query text for completer highlighting."""
+		line_edit = self.id_combo.lineEdit()
+		if line_edit is None:
+			return ""
+		return line_edit.text()
+
+	def _is_combo_popup_interaction(self, candidate: Optional[QtWidgets.QWidget]) -> bool:
+		"""Return True when the clicked widget belongs to combo popup interaction widgets."""
+		if candidate is None:
+			return False
+		widgets: List[Optional[QtWidgets.QWidget]] = [self.id_combo, self.id_combo.lineEdit(), self.id_combo.view()]
+		completer = self.id_combo.completer()
+		if completer is not None:
+			widgets.append(completer.popup())
+		for target in widgets:
+			if target is not None and self._widget_is_or_inside(candidate, target):
+				return True
+		return False
 
 	def _clear_text_input_focus(self) -> None:
 		"""Remove focus from active text inputs and return it to main window.
@@ -724,9 +895,22 @@ class QSOViewer(QtWidgets.QMainWindow):
 		Called by Esc key and external click event filter to dismiss text editing mode."""
 		if not self._is_text_input_focused():
 			return
+		completer = self.id_combo.completer()
+		if completer is not None and completer.popup().isVisible():
+			completer.popup().hide()
+		combo_line_edit = self.id_combo.lineEdit()
+		if combo_line_edit is not None:
+			combo_line_edit.clearFocus()
+		# Clear focus on the combo widget itself in addition to its line-edit
+		# child; editable QComboBox can retain apparent focus at the parent level.
+		self.id_combo.clearFocus()
 		focused = self.focusWidget()
 		if focused is not None:
 			focused.clearFocus()
+		# Transfer focus to the central widget.  This only succeeds because
+		# _build_ui now sets ClickFocus policy on it; without an accepting
+		# focus policy the call is silently ignored and the line-edit can
+		# re-acquire focus from Qt's internal focus chain.
 		self.centralWidget().setFocus(QtCore.Qt.FocusReason.OtherFocusReason)
 
 	def eventFilter(self, obj: QtCore.QObject, event: QtCore.QEvent) -> bool:
@@ -742,11 +926,27 @@ class QSOViewer(QtWidgets.QMainWindow):
 		Returns:
 			False to allow event to propagate normally.
 		"""
+		if (
+			event.type() == QtCore.QEvent.Type.KeyPress
+			and isinstance(event, QtGui.QKeyEvent)
+			and event.key() == QtCore.Qt.Key.Key_Escape
+			and self._is_text_input_focused()
+		):
+			self._clear_text_input_focus()
+			# Do NOT return True here.  Allowing the event to propagate lets
+			# the combo box run its own Escape handler, which reverts the
+			# line-edit text back to the currently loaded object's ID.  That
+			# handler never calls setFocus(), so focus stays wherever
+			# _clear_text_input_focus() sent it.  Consuming the event with
+			# return True left the combo in a half-edited state and prevented
+			# the focus transfer from completing cleanly.
+
 		if event.type() == QtCore.QEvent.Type.MouseButtonPress and self._is_text_input_focused():
 			clicked_widget = obj if isinstance(obj, QtWidgets.QWidget) else None
 			if clicked_widget is None or (
 				not self._widget_is_or_inside(clicked_widget, self.notes_editor)
 				and not self._widget_is_or_inside(clicked_widget, self.z_value_edit)
+				and not self._is_combo_popup_interaction(clicked_widget)
 			):
 				self._clear_text_input_focus()
 		return super().eventFilter(obj, event)
@@ -781,8 +981,11 @@ class QSOViewer(QtWidgets.QMainWindow):
 			"Keyboard shortcuts\n\n"
 			"Left Arrow: Previous object\n"
 			"Right Arrow: Next object\n"
+			"[: Pan spectrum view left\n"
+			"]: Pan spectrum view right\n"
 			"q: Quit\n"
 			"F1: Show this help\n"
+			"v: Reset plot view\n"
 			"z: Reset redshift\n"
 			"e: Toggle emission lines\n"
 			"a: Toggle absorption lines\n"
@@ -792,9 +995,15 @@ class QSOViewer(QtWidgets.QMainWindow):
 			"Alt+Right: Increase redshift (large step)\n"
 			"Shift+Alt+Left: Decrease redshift (very large step)\n"
 			"Shift+Alt+Right: Increase redshift (very large step)\n\n"
-			"Shortcuts are disabled while typing in notes or redshift text fields."
+			"Shortcuts are disabled while typing in notes, redshift, or Target ID fields."
 		)
 		QtWidgets.QMessageBox.information(self, "Keyboard Shortcuts", message)
+
+	def _on_shortcut_reset_view(self) -> None:
+		"""Keyboard shortcut handler: reset plot ranges to defaults (v key)."""
+		if self._is_text_input_focused():
+			return
+		self._reset_view()
 
 	def _on_shortcut_reset_redshift(self) -> None:
 		"""Keyboard shortcut handler: reset redshift to catalog value (z key)."""
@@ -829,6 +1038,33 @@ class QSOViewer(QtWidgets.QMainWindow):
 		cursor.movePosition(QtGui.QTextCursor.MoveOperation.End)
 		self.notes_editor.setTextCursor(cursor)
 
+	def _pan_x_fraction(self, direction: int, fraction: float = 0.2) -> None:
+		"""Pan current x-range by a fraction of its width.
+
+		Args:
+			direction: -1 for left, +1 for right.
+			fraction: Fraction of current x-span to shift.
+		"""
+		if self._is_text_input_focused():
+			return
+
+		x_range = self.raw_plot.getViewBox().viewRange()[0]
+		x_min, x_max = float(x_range[0]), float(x_range[1])
+		x_span = x_max - x_min
+		if x_span <= 0:
+			return
+
+		delta = max(fraction, 0.0) * x_span * (1 if direction > 0 else -1)
+		self.raw_plot.setXRange(x_min + delta, x_max + delta, padding=0.0)
+
+	def _on_shortcut_pan_left(self) -> None:
+		"""Keyboard shortcut handler: pan spectrum x-range left ([ key)."""
+		self._pan_x_fraction(-1, 0.2)
+
+	def _on_shortcut_pan_right(self) -> None:
+		"""Keyboard shortcut handler: pan spectrum x-range right (] key)."""
+		self._pan_x_fraction(1, 0.2)
+
 	def _step_redshift_slider(self, direction: int, multiplier: int = 1) -> None:
 		"""Adjust redshift slider by stepping in the specified direction.
 		
@@ -861,28 +1097,109 @@ class QSOViewer(QtWidgets.QMainWindow):
 
 	def _populate_ids(self) -> None:
 		"""Fill the DESI_ID combo box with all available objects from the store."""
-		self.id_combo.blockSignals(True)
-		self.id_combo.clear()
-		self.id_combo.addItems(self.store.ids)
-		self.id_combo.blockSignals(False)
+		if self.comment_filter_button.isChecked():
+			self._visible_ids = [
+				desi_id
+				for desi_id in self.store.ids
+				if self.store.notes_store.get_note(desi_id).strip()
+			]
+		else:
+			self._visible_ids = list(self.store.ids)
 
-	def _on_combo_changed(self, desi_id: str) -> None:
-		"""Handle combo box selection change: load selected QSO."""
-		if not desi_id or desi_id == self.current_id:
+		self._combo_updating = True
+		try:
+			self.id_combo.blockSignals(True)
+			self.id_combo.clear()
+			self.id_combo.addItems(self._visible_ids)
+			self.id_combo.blockSignals(False)
+			self._id_source_model.setStringList(self._visible_ids)
+			self._id_to_index = {desi_id: index for index, desi_id in enumerate(self._visible_ids)}
+			self._id_filter_model.setFilterRegularExpression(QtCore.QRegularExpression())
+		finally:
+			self._combo_updating = False
+
+	def _on_comment_filter_toggled(self, checked: bool) -> None:
+		"""Rebuild Target ID list when comment-only filter toggle changes."""
+		previous_id = self.current_id
+		self._populate_ids()
+
+		if not self._visible_ids:
+			self.current_index = -1
+			self.prev_button.setEnabled(False)
+			self.next_button.setEnabled(False)
+			self.current_id = None
+			self._combo_updating = True
+			try:
+				self.id_combo.blockSignals(True)
+				self.id_combo.setCurrentText("")
+				self.id_combo.blockSignals(False)
+			finally:
+				self._combo_updating = False
+			if checked:
+				self.statusBar().showMessage("No targets with non-empty comments.")
 			return
-		self.set_current_object(desi_id)
+
+		if previous_id is not None and previous_id in self._id_to_index:
+			self.set_current_object(previous_id)
+		else:
+			self.set_current_object(self._visible_ids[0])
+
+	def _on_combo_edit_text_changed(self, text: str) -> None:
+		"""Update typeahead suggestions while typing without loading new objects."""
+		if self._combo_updating:
+			return
+		pattern = QtCore.QRegularExpression.escape(text)
+		if pattern:
+			regex = QtCore.QRegularExpression(pattern, QtCore.QRegularExpression.PatternOption.CaseInsensitiveOption)
+		else:
+			regex = QtCore.QRegularExpression()
+		self._id_filter_model.setFilterRegularExpression(regex)
+		if text:
+			self._id_completer.setCompletionPrefix(text)
+			self._id_completer.complete()
+
+	def _on_combo_return_pressed(self) -> None:
+		"""Commit typed DESI_ID on Enter key and load object if valid."""
+		line_edit = self.id_combo.lineEdit()
+		if line_edit is None:
+			return
+		self._commit_combo_selection(line_edit.text())
+
+	def _on_combo_committed(self, desi_id: str) -> None:
+		"""Commit selected DESI_ID from combo/completer activation."""
+		self._commit_combo_selection(desi_id)
+
+	def _commit_combo_selection(self, desi_id: str) -> None:
+		"""Load a DESI object for explicit combo commit events only."""
+		if self._combo_updating:
+			return
+		normalized = normalize_desi_id(desi_id)
+		if not normalized:
+			return
+		if normalized == self.current_id:
+			return
+		if normalized not in self._id_to_index:
+			if self.current_id is not None:
+				self._combo_updating = True
+				try:
+					self.id_combo.setCurrentText(self.current_id)
+				finally:
+					self._combo_updating = False
+			self.statusBar().showMessage(f"Unknown DESI_ID: {normalized}")
+			return
+		self.set_current_object(normalized)
 
 	def _go_previous(self) -> None:
 		"""Navigate to the previous QSO in catalog order."""
 		if self.current_index <= 0:
 			return
-		self.set_current_object(self.store.ids[self.current_index - 1])
+		self.set_current_object(self._visible_ids[self.current_index - 1])
 
 	def _go_next(self) -> None:
 		"""Navigate to the next QSO in catalog order."""
-		if self.current_index >= len(self.store.ids) - 1:
+		if self.current_index >= len(self._visible_ids) - 1:
 			return
-		self.set_current_object(self.store.ids[self.current_index + 1])
+		self.set_current_object(self._visible_ids[self.current_index + 1])
 
 	def _configure_redshift_controls(self, desi_id: str) -> None:
 		"""Set up redshift slider, text field, and limits for a given QSO.
@@ -1025,18 +1342,22 @@ class QSOViewer(QtWidgets.QMainWindow):
 			self._flush_current_note()
 
 		normalized = normalize_desi_id(desi_id)
-		if normalized not in self.store.ids:
+		if normalized not in self._id_to_index:
 			return
 
 		self.current_id = normalized
-		self.current_index = self.store.ids.index(normalized)
+		self.current_index = self._id_to_index[normalized]
 
-		self.id_combo.blockSignals(True)
-		self.id_combo.setCurrentText(normalized)
-		self.id_combo.blockSignals(False)
+		self._combo_updating = True
+		try:
+			self.id_combo.blockSignals(True)
+			self.id_combo.setCurrentText(normalized)
+			self.id_combo.blockSignals(False)
+		finally:
+			self._combo_updating = False
 
 		self.prev_button.setEnabled(self.current_index > 0)
-		self.next_button.setEnabled(self.current_index < len(self.store.ids) - 1)
+		self.next_button.setEnabled(self.current_index < len(self._visible_ids) - 1)
 		self._configure_redshift_controls(normalized)
 
 		self._render_cutout(normalized)
@@ -1231,6 +1552,48 @@ class QSOViewer(QtWidgets.QMainWindow):
 		if self.clip_legend is not None:
 			self.clip_legend.addItem(self._legend_emission_item, "Emission Line")
 			self.clip_legend.addItem(self._legend_absorption_item, "Absorption Line")
+
+	def _init_hover_coordinate_labels(self) -> None:
+		"""Create in-plot labels and connect mouse-move handlers for live cursor coordinates."""
+		for key, plot in (("raw", self.raw_plot), ("clip", self.clip_plot)):
+			label = pg.TextItem(anchor=(0, 1), color=(20, 20, 20), fill=(255, 255, 255, 210))
+			label.hide()
+			plot.addItem(label, ignoreBounds=True)
+			self._hover_labels[key] = label
+
+			proxy = pg.SignalProxy(
+				plot.scene().sigMouseMoved,
+				rateLimit=60,
+				slot=lambda event, source_plot=plot, source_key=key: self._on_plot_mouse_moved(source_key, source_plot, event),
+			)
+			self._mouse_move_proxies.append(proxy)
+
+	def _on_plot_mouse_moved(self, plot_key: str, source_plot: pg.PlotWidget, event: Tuple[object, ...]) -> None:
+		"""Update in-plot hover label with x/y coordinates for the active cursor position."""
+		if not event:
+			return
+
+		scene_pos = event[0]
+		view_box = source_plot.getViewBox()
+		hover_label = self._hover_labels.get(plot_key)
+		if hover_label is None:
+			return
+		if not view_box.sceneBoundingRect().contains(scene_pos):
+			hover_label.hide()
+			return
+
+		mouse_point = view_box.mapSceneToView(scene_pos)
+		x_range, y_range = view_box.viewRange()
+		x_span = max(x_range[1] - x_range[0], 1e-6)
+		y_span = max(y_range[1] - y_range[0], 1e-6)
+		x_offset = 0.01 * x_span
+		y_offset = 0.04 * y_span
+		x_pos = min(mouse_point.x() + x_offset, x_range[1] - 0.02 * x_span)
+		y_pos = min(mouse_point.y() + y_offset, y_range[1] - 0.02 * y_span)
+
+		hover_label.setText(f"x={mouse_point.x():.2f}\ny={mouse_point.y():.3g}")
+		hover_label.setPos(x_pos, y_pos)
+		hover_label.show()
 
 	def _make_trace_item(self, plot: pg.PlotWidget, pen: pg.mkPen) -> pg.PlotDataItem:
 		"""Create a persistent plot item for spectral data (flux or error trace).
@@ -1489,9 +1852,30 @@ class QSOViewer(QtWidgets.QMainWindow):
 		"""Write current QSO note to persistent storage."""
 		if self.current_id is None:
 			return
+		saved_id = self.current_id
 		note = self.notes_editor.toPlainText()
-		self.store.notes_store.save_note(self.current_id, note)
-		self.statusBar().showMessage(f"Saved note for {self.current_id}", 1500)
+		self.store.notes_store.save_note(saved_id, note)
+		if self.comment_filter_button.isChecked():
+			# Keep list membership synchronized with persisted note content.
+			self._populate_ids()
+			if saved_id not in self._id_to_index:
+				if self._visible_ids:
+					# Avoid recursive flush in set_current_object during filtered-list switches.
+					self.current_id = None
+					self.set_current_object(self._visible_ids[0])
+				else:
+					self.current_index = -1
+					self.prev_button.setEnabled(False)
+					self.next_button.setEnabled(False)
+					self.current_id = None
+					self._combo_updating = True
+					try:
+						self.id_combo.blockSignals(True)
+						self.id_combo.setCurrentText("")
+						self.id_combo.blockSignals(False)
+					finally:
+						self._combo_updating = False
+		self.statusBar().showMessage(f"Saved note for {saved_id}", 1500)
 
 	def closeEvent(self, event: QtGui.QCloseEvent) -> None:
 		"""Handle window close event: save any pending note before exit."""
